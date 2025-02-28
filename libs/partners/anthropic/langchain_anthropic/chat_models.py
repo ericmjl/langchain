@@ -244,6 +244,23 @@ def _format_messages(
                                     if k in ("type", "text", "cache_control")
                                 }
                             )
+                    elif block["type"] == "thinking":
+                        content.append(
+                            {
+                                k: v
+                                for k, v in block.items()
+                                if k
+                                in ("type", "thinking", "cache_control", "signature")
+                            }
+                        )
+                    elif block["type"] == "redacted_thinking":
+                        content.append(
+                            {
+                                k: v
+                                for k, v in block.items()
+                                if k in ("type", "cache_control", "data")
+                            }
+                        )
                     elif block["type"] == "tool_result":
                         tool_content = _format_messages(
                             [HumanMessage(block["content"])]
@@ -368,7 +385,7 @@ class ChatAnthropic(BaseChatModel):
         .. code-block:: python
 
             for chunk in llm.stream(messages):
-                print(chunk)
+                print(chunk.text(), end="")
 
         .. code-block:: python
 
@@ -492,6 +509,93 @@ class ChatAnthropic(BaseChatModel):
 
             "The image depicts a sunny day with a partly cloudy sky. The sky is a brilliant blue color with scattered white clouds drifting across. The lighting and cloud patterns suggest pleasant, mild weather conditions. The scene shows a grassy field or meadow with a wooden boardwalk trail leading through it, indicating an outdoor setting on a nice day well-suited for enjoying nature."
 
+    Extended thinking:
+        Claude 3.7 Sonnet supports an
+        `extended thinking <https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking>`_
+        feature, which will output the step-by-step reasoning process that led to its
+        final answer.
+
+        To use it, specify the `thinking` parameter when initializing `ChatAnthropic`.
+        It can also be passed in as a kwarg during invocation.
+
+        You will need to specify a token budget to use this feature. See usage example:
+
+        .. code-block:: python
+
+            from langchain_anthropic import ChatAnthropic
+
+            llm = ChatAnthropic(
+                model="claude-3-7-sonnet-latest",
+                max_tokens=5000,
+                thinking={"type": "enabled", "budget_tokens": 2000},
+            )
+
+            response = llm.invoke("What is the cube root of 50.653?")
+            response.content
+
+        .. code-block:: python
+
+            [{'signature': '...', 'thinking': "To find the cube root of 50.653...", 'type': 'thinking'}, {'text': 'The cube root of 50.653 is ...', 'type': 'text'}]
+
+    Citations:
+        Anthropic supports a
+        `citations <https://docs.anthropic.com/en/docs/build-with-claude/citations>`_
+        feature that lets Claude attach context to its answers based on source
+        documents supplied by the user. When
+        `document content blocks <https://docs.anthropic.com/en/docs/build-with-claude/citations#document-types>`_
+        with ``"citations": {"enabled": True}`` are included in a query, Claude may
+        generate citations in its response.
+
+        .. code-block:: python
+
+            from langchain_anthropic import ChatAnthropic
+
+            llm = ChatAnthropic(model="claude-3-5-haiku-latest")
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "text",
+                                "media_type": "text/plain",
+                                "data": "The grass is green. The sky is blue.",
+                            },
+                            "title": "My Document",
+                            "context": "This is a trustworthy document.",
+                            "citations": {"enabled": True},
+                        },
+                        {"type": "text", "text": "What color is the grass and sky?"},
+                    ],
+                }
+            ]
+            response = llm.invoke(messages)
+            response.content
+
+        .. code-block:: python
+
+            [{'text': 'Based on the document, ', 'type': 'text'},
+            {'text': 'the grass is green',
+            'type': 'text',
+            'citations': [{'type': 'char_location',
+                'cited_text': 'The grass is green. ',
+                'document_index': 0,
+                'document_title': 'My Document',
+                'start_char_index': 0,
+                'end_char_index': 20}]},
+            {'text': ', and ', 'type': 'text'},
+            {'text': 'the sky is blue',
+            'type': 'text',
+            'citations': [{'type': 'char_location',
+                'cited_text': 'The sky is blue.',
+                'document_index': 0,
+                'document_title': 'My Document',
+                'start_char_index': 20,
+                'end_char_index': 36}]},
+            {'text': '.', 'type': 'text'}]
+
     Token usage:
         .. code-block:: python
 
@@ -600,6 +704,10 @@ class ChatAnthropic(BaseChatModel):
     message chunks will be generated during the stream including usage metadata.
     """
 
+    thinking: Optional[Dict[str, Any]] = Field(default=None)
+    """Parameters for Claude reasoning,
+    e.g., ``{"type": "enabled", "budget_tokens": 10_000}``"""
+
     @property
     def _llm_type(self) -> str:
         """Return type of chat model."""
@@ -631,12 +739,13 @@ class ChatAnthropic(BaseChatModel):
             "streaming": self.streaming,
             "max_retries": self.max_retries,
             "default_request_timeout": self.default_request_timeout,
+            "thinking": self.thinking,
         }
 
     def _get_ls_params(
         self, stop: Optional[List[str]] = None, **kwargs: Any
     ) -> LangSmithParams:
-        """Get the parameters used to invoke the model."""
+        """Get standard params for tracing."""
         params = self._get_invocation_params(stop=stop, **kwargs)
         ls_params = LangSmithParams(
             ls_provider="anthropic",
@@ -702,6 +811,8 @@ class ChatAnthropic(BaseChatModel):
             **self.model_kwargs,
             **kwargs,
         }
+        if self.thinking is not None:
+            payload["thinking"] = self.thinking
         return {k: v for k, v in payload.items() if v is not None}
 
     def _stream(
@@ -718,7 +829,11 @@ class ChatAnthropic(BaseChatModel):
         kwargs["stream"] = True
         payload = self._get_request_payload(messages, stop=stop, **kwargs)
         stream = self._client.messages.create(**payload)
-        coerce_content_to_string = not _tools_in_params(payload)
+        coerce_content_to_string = (
+            not _tools_in_params(payload)
+            and not _documents_in_params(payload)
+            and not _thinking_in_params(payload)
+        )
         for event in stream:
             msg = _make_message_chunk_from_anthropic_event(
                 event,
@@ -745,7 +860,11 @@ class ChatAnthropic(BaseChatModel):
         kwargs["stream"] = True
         payload = self._get_request_payload(messages, stop=stop, **kwargs)
         stream = await self._async_client.messages.create(**payload)
-        coerce_content_to_string = not _tools_in_params(payload)
+        coerce_content_to_string = (
+            not _tools_in_params(payload)
+            and not _documents_in_params(payload)
+            and not _thinking_in_params(payload)
+        )
         async for event in stream:
             msg = _make_message_chunk_from_anthropic_event(
                 event,
@@ -761,10 +880,33 @@ class ChatAnthropic(BaseChatModel):
     def _format_output(self, data: Any, **kwargs: Any) -> ChatResult:
         data_dict = data.model_dump()
         content = data_dict["content"]
+
+        # Remove citations if they are None - introduced in anthropic sdk 0.45
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and "citations" in block
+                and block["citations"] is None
+            ):
+                block.pop("citations")
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "thinking"
+                and "text" in block
+                and block["text"] is None
+            ):
+                block.pop("text")
+
         llm_output = {
             k: v for k, v in data_dict.items() if k not in ("content", "role", "type")
         }
-        if len(content) == 1 and content[0]["type"] == "text":
+        if "model" in llm_output and "model_name" not in llm_output:
+            llm_output["model_name"] = llm_output["model"]
+        if (
+            len(content) == 1
+            and content[0]["type"] == "text"
+            and not content[0].get("citations")
+        ):
             msg = AIMessage(content=content[0]["text"])
         elif any(block["type"] == "tool_use" for block in content):
             tool_calls = extract_tool_calls(content)
@@ -1107,9 +1249,13 @@ class ChatAnthropic(BaseChatModel):
                 Added support for TypedDict class as `schema`.
 
         """  # noqa: E501
-
-        tool_name = convert_to_anthropic_tool(schema)["name"]
-        llm = self.bind_tools([schema], tool_choice=tool_name)
+        formatted_tool = convert_to_anthropic_tool(schema)
+        tool_name = formatted_tool["name"]
+        llm = self.bind_tools(
+            [schema],
+            tool_choice=tool_name,
+            structured_output_format={"kwargs": {}, "schema": formatted_tool},
+        )
         if isinstance(schema, type) and is_basemodel_subclass(schema):
             output_parser: OutputParserLike = PydanticToolsParser(
                 tools=[schema], first_tool_only=True
@@ -1246,6 +1392,23 @@ def _tools_in_params(params: dict) -> bool:
     )
 
 
+def _thinking_in_params(params: dict) -> bool:
+    return params.get("thinking", {}).get("type") == "enabled"
+
+
+def _documents_in_params(params: dict) -> bool:
+    for message in params.get("messages", []):
+        if isinstance(message.get("content"), list):
+            for block in message["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "document"
+                    and block.get("citations", {}).get("enabled")
+                ):
+                    return True
+    return False
+
+
 class _AnthropicToolUse(TypedDict):
     type: Literal["tool_use"]
     name: str
@@ -1284,39 +1447,64 @@ def _make_message_chunk_from_anthropic_event(
     # See https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/lib/streaming/_messages.py  # noqa: E501
     if event.type == "message_start" and stream_usage:
         usage_metadata = _create_usage_metadata(event.message.usage)
+        if hasattr(event.message, "model"):
+            response_metadata = {"model_name": event.message.model}
+        else:
+            response_metadata = {}
         message_chunk = AIMessageChunk(
             content="" if coerce_content_to_string else [],
             usage_metadata=usage_metadata,
+            response_metadata=response_metadata,
         )
     elif (
         event.type == "content_block_start"
         and event.content_block is not None
-        and event.content_block.type == "tool_use"
+        and event.content_block.type in ("tool_use", "document", "redacted_thinking")
     ):
         if coerce_content_to_string:
             warnings.warn("Received unexpected tool content block.")
         content_block = event.content_block.model_dump()
         content_block["index"] = event.index
-        tool_call_chunk = create_tool_call_chunk(
-            index=event.index,
-            id=event.content_block.id,
-            name=event.content_block.name,
-            args="",
-        )
+        if event.content_block.type == "tool_use":
+            tool_call_chunk = create_tool_call_chunk(
+                index=event.index,
+                id=event.content_block.id,
+                name=event.content_block.name,
+                args="",
+            )
+            tool_call_chunks = [tool_call_chunk]
+        else:
+            tool_call_chunks = []
         message_chunk = AIMessageChunk(
             content=[content_block],
-            tool_call_chunks=[tool_call_chunk],  # type: ignore
+            tool_call_chunks=tool_call_chunks,  # type: ignore
         )
     elif event.type == "content_block_delta":
-        if event.delta.type == "text_delta":
-            if coerce_content_to_string:
+        if event.delta.type in ("text_delta", "citations_delta"):
+            if coerce_content_to_string and hasattr(event.delta, "text"):
                 text = event.delta.text
                 message_chunk = AIMessageChunk(content=text)
             else:
                 content_block = event.delta.model_dump()
                 content_block["index"] = event.index
                 content_block["type"] = "text"
+                if "citation" in content_block:
+                    content_block["citations"] = [content_block.pop("citation")]
                 message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "thinking_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "signature_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
         elif event.delta.type == "input_json_delta":
             content_block = event.delta.model_dump()
             content_block["index"] = event.index
